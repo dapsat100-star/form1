@@ -1,14 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Relatório Técnico – Streamlit
-Recursos:
-- Formulário completo (metadados, conteúdo, autores, refs, anexos)
-- Logo no cabeçalho (PNG/JPG) + largura configurável
-- Prévia em Markdown
-- Exporta: Markdown (.md), PDF (ReportLab) e DOCX (python-docx)
-- Rascunho local (.json), autosave e carregar rascunhos
-- Gerador automático de código (ex.: MavipeRTEC001)
-- Upload manual e AUTOMÁTICO para Google Drive e GitHub (via st.secrets)
+Relatório Técnico – Streamlit (Drive/GitHub + Shared Drives)
 """
 
 import io, os, base64, json, datetime as dt
@@ -156,11 +148,7 @@ def build_pdf(r: Relatorio, logo_bytes: Optional[bytes], logo_width_cm: float) -
     if r.observacoes:
         sec("Observações", r.observacoes)
 
-    doc = doc  # keep reference for linter
-    from reportlab.platypus import SimpleDocTemplate as _tmp  # noqa
-    # (já foi construído acima)
-    story_doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
-    story_doc.build(story)
+    doc.build(story)
     return buf.getvalue()
 
 def build_docx(r: Relatorio, logo_bytes: Optional[bytes], logo_width_cm: float) -> bytes:
@@ -233,7 +221,7 @@ def build_docx(r: Relatorio, logo_bytes: Optional[bytes], logo_width_cm: float) 
     doc.save(bio)
     return bio.getvalue()
 
-# ===================== Drive/GitHub =====================
+# ===================== Google Drive (inclui Shared Drives) =====================
 def get_drive_service():
     try:
         from google.oauth2.service_account import Credentials
@@ -252,9 +240,15 @@ def drive_upload_bytes(service, folder_id: str, filename: str, data: bytes, mime
     import io as _io
     file_metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(_io.BytesIO(data), mimetype=mime, resumable=False)
-    f = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute()
+    f = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,  # <— ESSENCIAL p/ Shared Drives
+    ).execute()
     return f.get("webViewLink", "")
 
+# ===================== GitHub (opcional) =====================
 def github_upload_bytes(filename: str, data: bytes, message: str) -> str:
     try:
         gh = st.secrets.get("github", {})
@@ -301,6 +295,26 @@ with st.sidebar:
         st.session_state.rel = Relatorio()
     rel: Relatorio = st.session_state.rel
 
+    # Diagnóstico rápido (secrets)
+    ok_sa = "gcp_service_account" in st.secrets
+    ok_drive = "drive" in st.secrets and "folder_id" in st.secrets["drive"]
+    st.write(f"SA carregada: {'✅' if ok_sa else '❌'}")
+    st.write(f"Drive folder_id: {'✅' if ok_drive else '❌'}")
+
+    # Botão de teste de acesso ao Drive
+    if st.button("🔎 Testar acesso ao Drive"):
+        try:
+            svc = get_drive_service()
+            fid = st.secrets["drive"]["folder_id"]
+            info = svc.files().get(
+                fileId=fid,
+                fields="id,name,mimeType",
+                supportsAllDrives=True
+            ).execute()
+            st.success(f"Acesso OK: {info['name']} ({info['mimeType']})")
+        except Exception as e:
+            st.error(f"Sem acesso: {e}")
+
     # Código automático
     st.subheader("Código automático")
     code_prefix = st.text_input("Prefixo", value=st.session_state.get("code_prefix","MavipeRTEC"))
@@ -324,42 +338,6 @@ with st.sidebar:
     st.session_state.auto_drive = auto_drive
     auto_gh = st.checkbox("GitHub (usar st.secrets)", value=st.session_state.get("auto_gh", False))
     st.session_state.auto_gh = auto_gh
-
-    # Carregar/Salvar local
-    try:
-        p = Path(draft_dir); p.mkdir(parents=True, exist_ok=True)
-        opts = ["(nenhum)"] + [f.name for f in sorted(p.glob("*.json"))]
-    except Exception as e:
-        opts = ["(nenhum)"]
-        st.error(f"Pasta inválida: {e}")
-    pick = st.selectbox("Carregar rascunho", opts)
-    if pick != "(nenhum)":
-        try:
-            data = json.loads((Path(draft_dir)/pick).read_text(encoding="utf-8"))
-            st.session_state.rel = Relatorio(**data)
-            rel = st.session_state.rel
-            st.success(f"Carregado: {pick}")
-        except Exception as e:
-            st.error(f"Falha ao carregar: {e}")
-
-    if st.button("💾 Salvar local agora"):
-        try:
-            p = Path(draft_dir); p.mkdir(parents=True, exist_ok=True)
-            name = f"{(rel.codigo or 'relatorio').replace(' ','_')}.json"
-            (p / name).write_text(json.dumps(rel.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
-            st.success(f"Salvo: {p / name}")
-        except Exception as e:
-            st.error(f"Erro ao salvar: {e}")
-
-    st.markdown("---")
-    st.subheader("Logo")
-    logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
-    logo_width_cm = st.number_input("Largura do logo (cm)", 1.0, 12.0, 3.5, 0.5)
-    if "logo_bytes" not in st.session_state:
-        st.session_state.logo_bytes = None
-    if logo_file:
-        st.session_state.logo_bytes = logo_file.read()
-        st.success("Logo carregado.")
 
 # -------- Form --------
 rel: Relatorio = st.session_state.rel
@@ -428,58 +406,60 @@ with st.form("form"):
                 st.warning(f"Autosave falhou: {e}")
 
         # Exportações
+        logo_bytes = st.session_state.get("logo_bytes")
+        logo_width_cm = st.session_state.get("logo_width_cm", 3.5)
         md_bytes  = to_markdown(rel).encode("utf-8")
-        pdf_bytes = build_pdf(rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5) if "logo_width_cm" in st.session_state else 3.5)
-        docx_bytes= build_docx(rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5) if "logo_width_cm" in st.session_state else 3.5)
+        pdf_bytes = build_pdf(rel, logo_bytes, logo_width_cm)
+        docx_bytes= build_docx(rel, logo_bytes, logo_width_cm)
 
         # Uploads automáticos
-        base = (rel.codigo or "relatorio").replace(" ", "_")
+        base_name = (rel.codigo or "relatorio").replace(" ", "_")
         if st.session_state.get("auto_drive", False):
             try:
                 svc = get_drive_service()
                 folder_id = st.secrets.get("drive", {}).get("folder_id")
                 if not folder_id:
                     raise RuntimeError("Defina [drive].folder_id em st.secrets.")
-                drive_upload_bytes(svc, folder_id, f"{base}.json", json.dumps(rel.model_dump(), ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
-                drive_upload_bytes(svc, folder_id, f"{base}.md", md_bytes, "text/markdown")
-                drive_upload_bytes(svc, folder_id, f"{base}.pdf", pdf_bytes, "application/pdf")
-                drive_upload_bytes(svc, folder_id, f"{base}.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                drive_upload_bytes(svc, folder_id, f"{base_name}.json", json.dumps(rel.model_dump(), ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
+                drive_upload_bytes(svc, folder_id, f"{base_name}.md", md_bytes, "text/markdown")
+                drive_upload_bytes(svc, folder_id, f"{base_name}.pdf", pdf_bytes, "application/pdf")
+                drive_upload_bytes(svc, folder_id, f"{base_name}.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                 st.success("Upload automático → Google Drive concluído ✅")
             except Exception as e:
                 st.error(f"Drive (auto): {e}")
 
         if st.session_state.get("auto_gh", False):
             try:
-                import requests  # ensure available
-                def gh_put(name, data, mime_hint):
+                def gh_put(name, data):
                     url = f"https://api.github.com/repos/{st.secrets['github']['repo']}/contents/{st.secrets['github'].get('base_path','reports')}/{name}"
                     payload = {"message": f"auto: {name}", "content": base64.b64encode(data).decode("utf-8"), "branch": st.secrets['github'].get('branch','main')}
+                    import requests
                     r = requests.put(url, json=payload, headers={"Authorization": f"token {st.secrets['github']['token']}", "Accept": "application/vnd.github+json"}, timeout=30)
                     if r.status_code not in (200,201): raise RuntimeError(r.text)
-                gh_put(f"{base}.json", json.dumps(rel.model_dump(), ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
-                gh_put(f"{base}.md", md_bytes, "text/markdown")
-                gh_put(f"{base}.pdf", pdf_bytes, "application/pdf")
-                gh_put(f"{base}.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                gh_put(f"{base_name}.json", json.dumps(rel.model_dump(), ensure_ascii=False, indent=2).encode("utf-8"))
+                gh_put(f"{base_name}.md", md_bytes)
+                gh_put(f"{base_name}.pdf", pdf_bytes)
+                gh_put(f"{base_name}.docx", docx_bytes)
                 st.success("Upload automático → GitHub concluído ✅")
             except Exception as e:
                 st.error(f"GitHub (auto): {e}")
 
+# Prévia + downloads
 st.subheader("Prévia (Markdown)")
 st.code(to_markdown(st.session_state.rel), language="markdown")
 
-# Downloads manuais
 colA, colB, colC = st.columns(3)
 md_bytes = to_markdown(st.session_state.rel).encode("utf-8")
 colA.download_button("⬇️ .md", md_bytes, file_name=f"{(st.session_state.rel.codigo or 'relatorio')}.md", mime="text/markdown", use_container_width=True)
 
 try:
-    pdf_bytes = build_pdf(st.session_state.rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5) if "logo_width_cm" in st.session_state else 3.5)
+    pdf_bytes = build_pdf(st.session_state.rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5))
     colB.download_button("⬇️ PDF", pdf_bytes, file_name=f"{(st.session_state.rel.codigo or 'relatorio')}.pdf", mime="application/pdf", use_container_width=True)
 except Exception as e:
     colB.error(f"PDF: {e}")
 
 try:
-    docx_bytes = build_docx(st.session_state.rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5) if "logo_width_cm" in st.session_state else 3.5)
+    docx_bytes = build_docx(st.session_state.rel, st.session_state.get("logo_bytes"), st.session_state.get("logo_width_cm", 3.5))
     colC.download_button("⬇️ DOCX", docx_bytes, file_name=f"{(st.session_state.rel.codigo or 'relatorio')}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 except Exception as e:
     colC.error(f"DOCX: {e}")
